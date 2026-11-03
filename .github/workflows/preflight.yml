@@ -1,0 +1,117 @@
+name: Documentation baseline and patch
+
+on:
+  push:
+    branches: [ci/verify-agent-run-result-name]
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: Documentation (${{ matrix.revision.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        revision:
+          - name: baseline
+            sha: b9894248bfc6c6e82916e429ef1c13901cba665f
+          - name: patch
+            sha: 94fcd5596b7be488d4d1a68ad7bd62415f6e60f9
+    env:
+      CI: true
+      UV_FROZEN: "1"
+      UV_PYTHON: "3.13"
+      UV_PYTHON_PREFERENCE: only-managed
+      BLOCKBUSTER_ENABLED: false
+      PYDANTIC_AI_NO_BANNER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.revision.sha }}
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e
+        with:
+          python-version: "3.13"
+          enable-cache: false
+
+      - name: Install the locked documentation test dependencies
+        run: uv sync --frozen --all-extras --no-extra mcp-tasks --all-packages --reinstall-package griffelib
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ github.token }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/
+
+      - name: Format and lint
+        run: |
+          make format
+          make lint
+          git diff --exit-code
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Run Markdown pre-commit checks
+        run: uvx pre-commit run --all-files --verbose
+        env:
+          SKIP: no-commit-to-branch,format,lint,check-cassettes
+          UV_NO_SYNC: "1"
+
+      - name: Test documentation using the upstream docs-only test selection
+        run: >-
+          uv run --no-sync pytest
+          tests/test_examples.py
+          tests/harness/test_docs_installation.py
+          tests/test_docs_parity.py
+          tests/test_docs_navigation.py
+          tests/harness/test_docs_parity.py
+          tests/harness/test_doc_snippets.py
+          tests/harness/test_workspace_quickstarts.py
+          -n logical --dist=loadgroup
+          --junitxml=preflight-results.xml
+
+      - name: Verify run and run_sync return AgentRunResult without provider requests
+        run: |
+          uv run --no-sync python - <<'PY'
+          import asyncio
+          from pydantic_ai import Agent, models
+          from pydantic_ai.agent import AgentRunResult
+          from pydantic_ai.models.test import TestModel
+          models.ALLOW_MODEL_REQUESTS = False
+          agent = Agent(TestModel(custom_output_text='ok'))
+          for result in (agent.run_sync('Return ok'), asyncio.run(agent.run('Return ok'))):
+              assert type(result) is AgentRunResult
+              assert result.output == 'ok'
+          print('run and run_sync both return AgentRunResult')
+          PY
+
+      - name: Check documentation images
+        run: uvx tinicly docs --check
+
+      - name: Check local links and heading anchors
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          args: --no-progress --offline --include-fragments --config .github/workflows/lychee.toml './docs/**/*.md' './*.md' './examples/**/*.md'
+          fail: true
+
+      - name: Record tested revision and test results
+        if: always()
+        env:
+          REVISION_NAME: ${{ matrix.revision.name }}
+          REVISION_SHA: ${{ matrix.revision.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as report:
+              report.write(f"## {os.environ['REVISION_NAME']}\n\nCommit: `{os.environ['REVISION_SHA']}`\n\n")
+              path = Path('preflight-results.xml')
+              if path.exists():
+                  for suite in ET.parse(path).getroot().iter('testsuite'):
+                      report.write(f"{suite.attrib}\n")
+              else:
+                  report.write('Documentation test report was not produced. Check preceding steps.\n')
+          PY
